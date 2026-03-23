@@ -1,0 +1,14 @@
+[project]
+name = "treehole-listener"
+version = "0.1.0"
+description = "PKU Treehole 论坛关键词监控工具，支持邮件和系统通知提醒"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "beautifulsoup4>=4.14.3",
+    "pyyaml>=6.0.3",
+    "requests>=2.32.5",
+]
+
+[project.scripts]
+treehole-monitor = "monitor:main"

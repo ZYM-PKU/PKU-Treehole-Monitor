@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+
+# 运行状态
+.monitor_state.json
+monitor.log
+
+# 配置文件包含敏感信息
+config.yaml
