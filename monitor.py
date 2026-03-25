@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import random
 import uuid
 import smtplib
 import subprocess
@@ -107,7 +108,22 @@ class PKUAuth:
             )
         })
 
-    def login(self) -> tuple[str, dict]:
+    def login(self, max_retries: int = 3, retry_delay: int = 5) -> tuple[str, dict]:
+        """
+        带重试机制的登录方法
+        """
+        for attempt in range(1, max_retries + 1):
+            try:
+                return self._do_login()
+            except Exception as e:
+                logger.error(f"第 {attempt}/{max_retries} 次登录获取 Token 失败: {e}")
+                if attempt < max_retries:
+                    logger.info(f"等待 {retry_delay} 秒后重试...")
+                    time.sleep(retry_delay)
+                else:
+                    raise
+
+    def _do_login(self) -> tuple[str, dict]:
         """
         通过 IAAA 登录获取树洞 token。
         完整流程：
@@ -236,9 +252,11 @@ class TreeholeClient:
 
     SEND_SMS_URL = "https://treehole.pku.edu.cn/api/jwt_send_msg"
     VERIFY_SMS_URL = "https://treehole.pku.edu.cn/api/jwt_msg_verify"
+    VERIFY_OTP_URL = "https://treehole.pku.edu.cn/api/check_otp"
 
-    def __init__(self, token: str, cookies: dict | None = None):
+    def __init__(self, token: str, cookies: dict | None = None, config: dict | None = None):
         self.token = token
+        self.config = config
         self.session = requests.Session()
         if cookies:
             self.session.cookies.update(cookies)
@@ -251,11 +269,15 @@ class TreeholeClient:
             ),
         })
         self._verified = False
+        self._otp_verified = False
         self._structure_logged = False
 
     def _handle_sms_verification(self):
         """处理手机短信验证（首次使用时需要）"""
         logger.warning("⚠️  树洞要求手机短信验证（仅需验证一次）")
+
+        if self.config:
+            notify_system_event(self.config, "短信验证", "检测到树洞需要手机短信验证，程序已暂停，请前往控制台并输入验证码。")
 
         # 请求发送短信验证码
         try:
@@ -296,6 +318,43 @@ class TreeholeClient:
             logger.error(f"短信验证失败: {msg}")
             raise RuntimeError(f"短信验证失败: {msg}")
 
+    def _handle_otp_verification(self):
+        """处理北京大学App手机令牌验证"""
+        logger.warning("⚠️  树洞要求输入北京大学App手机令牌")
+
+        if self.config:
+            notify_system_event(self.config, "App手机令牌", "检测到树洞需要App手机动态令牌验证，程序已暂停，请前往控制台查看并输入。")
+
+        print("\n" + "=" * 50)
+        print("  📱 请打开北京大学App，查看并输入手机令牌 (6位数字)")
+        print("=" * 50)
+        code = input("  手机令牌: ").strip()
+
+        if not code:
+            raise RuntimeError("未输入手机令牌")
+
+        # 提交手机令牌
+        try:
+            resp = self.session.post(
+                self.VERIFY_OTP_URL,
+                json={"code": code},
+                headers={"Accept": "application/json"},
+                timeout=15,
+            )
+            result = resp.json() if resp.text else {}
+            logger.info(f"App令牌验证结果: {result}")
+        except Exception as e:
+            logger.error(f"App令牌提交失败: {e}")
+            raise
+
+        if result.get("success"):
+            logger.info("✅ App手机令牌验证成功")
+            self._otp_verified = True
+        else:
+            msg = result.get("message", "验证失败")
+            logger.error(f"App手机令牌验证失败: {msg}")
+            raise RuntimeError(f"App手机令牌验证失败: {msg}")
+
     def get_latest_posts(self, page: int = 1, limit: int = 25) -> list[dict]:
         """获取最新帖子列表"""
         params = {"page": page, "limit": limit}
@@ -319,6 +378,15 @@ class TreeholeClient:
                 return self.get_latest_posts(page=page, limit=limit)
             else:
                 logger.error("短信验证已完成但仍被拒绝，可能需要重新登录")
+                return []
+
+        # 检查是否需要 App 手机令牌验证 (code 40008)
+        if isinstance(data, dict) and data.get("code") == 40008:
+            if not getattr(self, "_otp_verified", False):
+                self._handle_otp_verification()
+                return self.get_latest_posts(page=page, limit=limit)
+            else:
+                logger.error("App令牌验证已完成但仍被拒绝，可能需要重新登录")
                 return []
 
         # API 可能返回多种格式:
@@ -491,6 +559,30 @@ def notify(config: dict, post: dict, keywords: list[str]):
 # 主监控逻辑
 # ---------------------------------------------------------------------------
 
+def notify_system_event(config: dict, event_type: str, msg: str):
+    """发送系统级别的通知（如需要验证码等）"""
+    subject = f"{config.get('email', {}).get('subject_prefix', '[树洞监控]')} ⚠️ 需要手动干预：{event_type}"
+    body = (
+        f"发生事件: 需要{event_type}\n"
+        f"{'─' * 40}\n"
+        f"详情: {msg}\n"
+        f"{'─' * 40}\n"
+        f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+    )
+
+    logger.info(f"🔔 发送系统事件提醒: {msg}")
+
+    # 邮件提醒
+    send_email(config, subject, body)
+
+    # 系统通知（macOS）
+    send_notification("树洞监控警告", msg)
+
+    # 系统提示音
+    if config.get("sound", {}).get("enabled"):
+        play_sound()
+
+
 class TreeholeMonitor:
     """主监控类"""
 
@@ -509,7 +601,7 @@ class TreeholeMonitor:
         """确保已登录，如果 token 失效则重新登录"""
         if self.client is None:
             token, cookies = self.auth.login()
-            self.client = TreeholeClient(token, cookies)
+            self.client = TreeholeClient(token, cookies, config=self.config)
             return
 
         # 测试 token 是否有效
@@ -517,7 +609,7 @@ class TreeholeMonitor:
         if posts is None:
             logger.warning("Token 可能已失效，正在重新登录...")
             token, cookies = self.auth.login()
-            self.client = TreeholeClient(token, cookies)
+            self.client = TreeholeClient(token, cookies, config=self.config)
 
     def check_new_posts(self):
         """检查新帖子并触发提醒"""
@@ -537,7 +629,7 @@ class TreeholeMonitor:
                 # 尝试重新登录
                 try:
                     token, cookies = self.auth.login()
-                    self.client = TreeholeClient(token, cookies)
+                    self.client = TreeholeClient(token, cookies, config=self.config)
                     posts = self.client.get_latest_posts(page=page, limit=per_page)
                 except Exception as e:
                     logger.error(f"重新登录失败: {e}")
@@ -600,8 +692,11 @@ class TreeholeMonitor:
                 logger.error(f"检查过程出错: {e}")
 
             try:
-                logger.info(f"等待 {interval} 秒后进行下一轮检查...")
-                time.sleep(interval)
+                # 添加随机偏差防止因为固定规律请求被识别，偏差在 1 秒 到 interval 的 30% 之间
+                deviation = random.uniform(1.0, max(3.0, interval * 0.3))
+                actual_interval = interval + deviation
+                logger.info(f"等待 {actual_interval:.1f} 秒后进行下一轮检查...")
+                time.sleep(actual_interval)
             except KeyboardInterrupt:
                 _console_print("\n🛑 监控已停止")
                 logger.info("🛑 监控已停止")
