@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import random
+import re
 import uuid
 import smtplib
 import subprocess
@@ -21,12 +22,18 @@ from email.mime.text import MIMEText
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
+import pyotp
 import requests
 import yaml
+from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
 
 # ---------------------------------------------------------------------------
-# 日志配置：文件记录全部日志，终端仅显示重要信息
+# Rich 控制台 & 日志
 # ---------------------------------------------------------------------------
+console = Console()
+
 LOG_FORMAT = "%(asctime)s [%(levelname)s] %(message)s"
 LOG_FILE = Path(__file__).parent / "monitor.log"
 
@@ -38,17 +45,6 @@ _file_handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
 _file_handler.setLevel(logging.INFO)
 _file_handler.setFormatter(logging.Formatter(LOG_FORMAT))
 logger.addHandler(_file_handler)
-
-# 终端 Handler：仅显示 WARNING 及以上
-_console_handler = logging.StreamHandler()
-_console_handler.setLevel(logging.WARNING)
-_console_handler.setFormatter(logging.Formatter(LOG_FORMAT))
-logger.addHandler(_console_handler)
-
-
-def _console_print(msg: str):
-    """直接打印到终端（用于启动信息和匹配提醒等需要用户看到的消息）"""
-    print(msg)
 
 # ---------------------------------------------------------------------------
 # 常量
@@ -273,8 +269,8 @@ class TreeholeClient:
         self._structure_logged = False
 
     def _handle_sms_verification(self):
-        """处理手机短信验证（首次使用时需要）"""
-        logger.warning("⚠️  树洞要求手机短信验证（仅需验证一次）")
+        """处理手机短信验证（首次使用时需要）— 必须手动输入"""
+        logger.warning("树洞要求手机短信验证（仅需验证一次）")
 
         if self.config:
             notify_system_event(self.config, "短信验证", "检测到树洞需要手机短信验证，程序已暂停，请前往控制台并输入验证码。")
@@ -287,11 +283,13 @@ class TreeholeClient:
         except Exception as e:
             logger.error(f"发送短信验证码失败: {e}")
 
-        # 提示用户输入验证码
-        print("\n" + "=" * 50)
-        print("  📱 请查看手机短信，输入收到的验证码")
-        print("=" * 50)
-        code = input("  验证码: ").strip()
+        console.print(
+            Panel(
+                "[bold yellow]请查看手机短信，输入收到的验证码[/bold yellow]",
+                title="[bold red]📱 短信验证[/bold red]",
+            )
+        )
+        code = console.input("  [bold yellow]验证码: [/bold yellow]").strip()
 
         if not code:
             raise RuntimeError("未输入验证码")
@@ -311,27 +309,49 @@ class TreeholeClient:
             raise
 
         if result.get("success"):
-            logger.info("✅ 短信验证成功")
+            console.print("[bold green]  ✓ 短信验证成功[/bold green]")
+            logger.info("短信验证成功")
             self._verified = True
         else:
             msg = result.get("message", "验证失败")
             logger.error(f"短信验证失败: {msg}")
             raise RuntimeError(f"短信验证失败: {msg}")
 
-    def _handle_otp_verification(self):
-        """处理北京大学App手机令牌验证"""
-        logger.warning("⚠️  树洞要求输入北京大学App手机令牌")
-
+    def _get_otp_code(self) -> str:
+        """获取 OTP 验证码：优先使用 TOTP 自动计算，否则手动输入"""
+        totp_secret = None
         if self.config:
-            notify_system_event(self.config, "App手机令牌", "检测到树洞需要App手机动态令牌验证，程序已暂停，请前往控制台查看并输入。")
+            totp_secret = self.config.get("totp_secret")
 
-        print("\n" + "=" * 50)
-        print("  📱 请打开北京大学App，查看并输入手机令牌 (6位数字)")
-        print("=" * 50)
-        code = input("  手机令牌: ").strip()
+        if totp_secret:
+            totp = pyotp.TOTP(totp_secret)
+            code = totp.now()
+            console.print(f"  [dim]TOTP 令牌已自动计算[/dim]")
+            logger.info(f"TOTP 令牌已计算: {code}")
+            return code
+        else:
+            # 无 TOTP 密钥，通知用户手动输入
+            if self.config:
+                notify_system_event(self.config, "App手机令牌", "检测到树洞需要App手机动态令牌验证，程序已暂停，请前往控制台查看并输入。")
 
-        if not code:
-            raise RuntimeError("未输入手机令牌")
+            console.print(
+                Panel(
+                    "[bold yellow]请打开北京大学App，查看并输入手机令牌 (6位数字)[/bold yellow]\n"
+                    "[dim]提示: 配置 totp_secret 可实现自动验证[/dim]",
+                    title="[bold red]📱 手机令牌验证[/bold red]",
+                )
+            )
+            code = console.input("  [bold yellow]手机令牌: [/bold yellow]").strip()
+            match = re.search(r"\d{6}", code)
+            if not match:
+                raise RuntimeError("无效的手机令牌")
+            return match.group()
+
+    def _handle_otp_verification(self):
+        """处理北京大学App手机令牌验证（支持 TOTP 自动 / 手动输入）"""
+        logger.warning("树洞要求输入北京大学App手机令牌")
+
+        code = self._get_otp_code()
 
         # 提交手机令牌
         try:
@@ -348,7 +368,8 @@ class TreeholeClient:
             raise
 
         if result.get("success"):
-            logger.info("✅ App手机令牌验证成功")
+            console.print("[bold green]  ✓ App手机令牌验证成功[/bold green]")
+            logger.info("App手机令牌验证成功")
             self._otp_verified = True
         else:
             msg = result.get("message", "验证失败")
@@ -541,8 +562,8 @@ def notify(config: dict, post: dict, keywords: list[str]):
         f"链接: https://treehole.pku.edu.cn/web/#/hole/{post_id}\n"
     )
 
-    logger.info(f"🔔 发现匹配帖子 #{post_id}: {summary[:60]}...")
-    _console_print(f"🔔 发现匹配帖子 #{post_id}: {summary[:60]}")
+    logger.info(f"发现匹配帖子 #{post_id}: {summary[:60]}...")
+    console.print(f"  [bold green]✔[/bold green] 发现匹配帖子 [cyan]#{post_id}[/cyan]: {summary[:60]}")
 
     # 邮件提醒
     send_email(config, subject, body)
@@ -665,19 +686,27 @@ class TreeholeMonitor:
         """主循环"""
         interval = self.config["monitor"].get("interval_seconds", 60)
 
-        # 启动信息 — 同时输出到终端和日志
-        banner = [
-            "=" * 50,
-            "  PKU Treehole 监控已启动",
-            f"  关键词: {self.keywords}",
-            f"  匹配模式: {self.match_mode}",
-            f"  检查间隔: {interval} 秒",
-            f"  日志文件: {LOG_FILE}",
-            "=" * 50,
-        ]
-        for line in banner:
-            _console_print(line)
-            logger.info(line)
+        # 启动标题
+        console.print(
+            Panel(
+                "[bold blue]🔔 PKU Treehole 监控[/bold blue]",
+                subtitle=f"[dim]{datetime.now():%Y-%m-%d %H:%M:%S}[/dim]",
+            )
+        )
+
+        # 系统概览
+        info = Table(show_header=False, box=None, padding=(0, 1))
+        info.add_column(style="cyan")
+        info.add_column(style="white")
+        info.add_row("关键词", ", ".join(self.keywords))
+        info.add_row("匹配模式", self.match_mode)
+        info.add_row("轮询间隔", f"{interval} 秒")
+        totp_status = "自动 (TOTP)" if self.config.get("totp_secret") else "手动输入"
+        info.add_row("令牌验证", totp_status)
+        info.add_row("日志文件", str(LOG_FILE))
+        console.print(Panel(info, title="[bold magenta]📋 系统概览[/bold magenta]"))
+
+        logger.info(f"监控已启动 - 关键词: {self.keywords}, 模式: {self.match_mode}, 间隔: {interval}s")
 
         while True:
             try:
@@ -698,8 +727,13 @@ class TreeholeMonitor:
                 logger.info(f"等待 {actual_interval:.1f} 秒后进行下一轮检查...")
                 time.sleep(actual_interval)
             except KeyboardInterrupt:
-                _console_print("\n🛑 监控已停止")
-                logger.info("🛑 监控已停止")
+                console.print(
+                    Panel(
+                        "[yellow]监控已停止[/yellow]",
+                        title="[bold red]🛑 已停止[/bold red]",
+                    )
+                )
+                logger.info("监控已停止")
                 break
 
 
@@ -712,11 +746,11 @@ def main():
 
     # 基本配置验证
     if not config.get("pku", {}).get("username") or not config.get("pku", {}).get("password"):
-        logger.error("❌ 请先在 config.yaml 中填写 PKU 用户名和密码")
+        console.print("[bold red]✗ 请先在 config.yaml 中填写 PKU 用户名和密码[/bold red]")
         sys.exit(1)
 
     if not config.get("keywords", {}).get("list"):
-        logger.error("❌ 请先在 config.yaml 中设置要监控的关键词列表")
+        console.print("[bold red]✗ 请先在 config.yaml 中设置要监控的关键词列表[/bold red]")
         sys.exit(1)
 
     if config.get("email", {}).get("enabled"):

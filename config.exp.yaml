@@ -34,3 +34,7 @@ email:
 # --- 系统提示音提醒（macOS） ---
 sound:
   enabled: true                    # 是否开启系统提示音
+
+# --- TOTP 自动验证（可选，配置后 App 令牌验证全自动） ---
+# 获取方法见 README
+totp_secret: ""                    # 留空则需要手动输入令牌

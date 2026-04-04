@@ -5,12 +5,14 @@ PKU 树洞论坛关键词监控工具。实时监控 [PKU Treehole](https://tree
 ## 功能特性
 
 - ✅ 自动通过 PKU IAAA 系统登录（支持 Token 自动续期）
+- ✅ **TOTP 自动验证** — 配置 TOTP 密钥后，App 手机令牌验证全自动完成
 - ✅ 定时轮询最新帖子
 - ✅ 支持多关键词 AND/OR 匹配模式
 - ✅ 邮件提醒（支持 HTML 美化邮件）
 - ✅ macOS 系统通知 + 提示音
 - ✅ 去重机制（避免重复提醒）
 - ✅ 状态持久化（重启后不会重复提醒已通知帖子）
+- ✅ **Rich 终端** — 使用 rich 库美化终端输出
 
 ## 快速开始
 
@@ -68,6 +70,22 @@ uv run treehole-monitor
 | `keywords.mode` | 匹配模式：`AND` / `OR` | `AND` |
 | `email.enabled` | 是否启用邮件提醒 | `true` |
 | `sound.enabled` | 是否启用系统提示音 | `true` |
+| `totp_secret` | TOTP 密钥（配置后 App 令牌验证自动完成） | 空 |
+
+## TOTP 自动验证设置（推荐）
+
+配置后，当树洞要求 App 手机令牌验证时会自动计算并提交，无需手动操作。
+
+1. 打开北京大学 App → `我的 → 手机令牌` → 点击 `解绑`
+2. 电脑打开 [我的门户](https://portal.pku.edu.cn/portal2017/#/setting) → `绑定手机令牌App`
+3. 截图二维码，用二维码解析工具提取内容，得到形如：
+   ```
+   otpauth://totp/iaaa.pku.edu.cn:2110000000?secret=K42CH3M2GADU6W8T&issuer=iaaa.pku.edu.cn
+   ```
+4. 其中 `secret=` 后的值（如 `K42CH3M2GADU6W8T`）即为 TOTP 密钥，填入 `config.yaml` 的 `totp_secret`
+5. 用 FreeOTP / Google Authenticator 等 App 扫码完成绑定
+
+> 如未配置 `totp_secret`，程序会在需要时暂停并提示手动输入令牌。
 
 ## 邮箱授权码获取
 
