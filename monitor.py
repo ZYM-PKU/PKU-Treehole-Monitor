@@ -7,6 +7,7 @@ PKU Treehole 论坛监控工具
 
 from __future__ import annotations
 
+import io
 import json
 import logging
 import random
@@ -25,9 +26,18 @@ from urllib.parse import urlparse, parse_qs
 import pyotp
 import requests
 import yaml
+from requests.adapters import HTTPAdapter
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
+from urllib3.util.retry import Retry
+
+# ---------------------------------------------------------------------------
+# Windows UTF-8 支持
+# ---------------------------------------------------------------------------
+if sys.platform == "win32":
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 
 # ---------------------------------------------------------------------------
 # Rich 控制台 & 日志
@@ -60,6 +70,36 @@ STATE_FILE = Path(__file__).parent / ".monitor_state.json"
 # 工具函数
 # ---------------------------------------------------------------------------
 
+def _create_robust_session() -> requests.Session:
+    """创建配置了合理重试策略的 Session（仅重试 HTTP 5xx，不重试连接错误）"""
+    session = requests.Session()
+    retry_strategy = Retry(
+        connect=0,
+        read=0,
+        status=2,
+        backoff_factor=1.0,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET", "POST"],
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    session.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        )
+    })
+    return session
+
+
+def _is_ssl_error(exc: Exception) -> bool:
+    """检测是否为 SSL 层面的连接错误（通常由 IP 限流导致）"""
+    msg = str(exc)
+    return any(kw in msg for kw in ("SSLEOFError", "SSLError", "ssl", "SSL"))
+
 def load_config(path: str = "config.yaml") -> dict:
     """加载 YAML 配置文件"""
     config_path = Path(__file__).parent / path
@@ -91,67 +131,46 @@ def save_state(state: dict):
 class PKUAuth:
     """处理 PKU IAAA 认证，获取树洞 API Token"""
 
-    def __init__(self, username: str, password: str):
+    def __init__(self, username: str, password: str, totp_secret: str | None = None):
         self.username = username
         self.password = password
-        self.session = requests.Session()
+        self.totp_secret = totp_secret
+        self.session = _create_robust_session()
         self.token: str | None = None
-        self.session.headers.update({
-            "User-Agent": (
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            )
-        })
 
     def login(self, max_retries: int = 3, retry_delay: int = 5) -> tuple[str, dict]:
-        """
-        带重试机制的登录方法
-        """
+        """带重试机制的登录方法"""
+        last_error = None
         for attempt in range(1, max_retries + 1):
             try:
                 return self._do_login()
             except Exception as e:
-                logger.error(f"第 {attempt}/{max_retries} 次登录获取 Token 失败: {e}")
-                if attempt < max_retries:
-                    logger.info(f"等待 {retry_delay} 秒后重试...")
+                last_error = e
+                if _is_ssl_error(e):
+                    logger.warning(f"第 {attempt} 次登录遇到 SSL 错误（限流），等待 {retry_delay * 2}s...")
+                    time.sleep(retry_delay * 2)
+                elif attempt < max_retries:
+                    logger.error(f"第 {attempt}/{max_retries} 次登录失败: {e}，等待 {retry_delay}s...")
                     time.sleep(retry_delay)
-                else:
-                    raise
+        raise last_error  # type: ignore[misc]
 
     def _do_login(self) -> tuple[str, dict]:
-        """
-        通过 IAAA 登录获取树洞 token。
-        完整流程：
-          1. GET /redirect_iaaa_login → 获取 _session / XSRF-TOKEN cookies
-          2. POST IAAA oauthlogin.do → 获取 IAAA token
-          3. GET /cas_iaaa_login?token=... → 用 cookies + IAAA token 换取树洞 JWT
-        返回 token 字符串。
-        """
+        """通过 IAAA 登录获取树洞 token，每次使用全新 session 确保 cookie 干净"""
         logger.info("正在通过 IAAA 登录 PKU 树洞...")
 
-        # 每次登录使用全新 session，确保 cookie 干净
-        self.session = requests.Session()
-        self.session.headers.update({
-            "User-Agent": (
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            )
-        })
+        self.session = _create_robust_session()
 
         # ----- Step 1: 访问 redirect_iaaa_login 建立会话 -----
         full_guid = str(uuid.uuid4())
-        short_uuid = full_guid.replace("-", "")[-12:]  # 后 12 位
+        short_uuid = full_guid.replace("-", "")[-12:]
         redirect_init_url = (
             f"https://treehole.pku.edu.cn/redirect_iaaa_login"
             f"?uuid=Web_PKUHOLE_2.0.0_WEB_UUID_{full_guid}"
         )
 
         try:
-            # allow_redirects=False 只是获取 cookies，不跟随到 IAAA 页面
             resp = self.session.get(redirect_init_url, timeout=15, allow_redirects=False)
-            logger.debug(f"redirect_iaaa_login status={resp.status_code}, cookies={dict(self.session.cookies)}")
+            logger.debug(f"redirect_iaaa_login status={resp.status_code}")
         except requests.RequestException as e:
             logger.error(f"初始化会话失败: {e}")
             raise
@@ -159,6 +178,12 @@ class PKUAuth:
         logger.info("会话 cookies 已获取")
 
         # ----- Step 2: IAAA 认证 -----
+        # 如有 TOTP secret，自动计算 otpCode
+        otp_code = ""
+        if self.totp_secret:
+            otp_code = pyotp.TOTP(self.totp_secret).now()
+            logger.info(f"IAAA 登录附带 TOTP: {otp_code}")
+
         redirect_url = f"https://treehole.pku.edu.cn/cas_iaaa_login?uuid={short_uuid}&plat=web"
 
         iaaa_payload = {
@@ -167,7 +192,7 @@ class PKUAuth:
             "password": self.password,
             "randCode": "",
             "smsCode": "",
-            "otpCode": "",
+            "otpCode": otp_code,
             "redirUrl": redirect_url,
         }
 
@@ -188,7 +213,6 @@ class PKUAuth:
         logger.info("IAAA 认证成功，正在获取树洞 Token...")
 
         # ----- Step 3: 用 IAAA token + session cookies 换取树洞 token -----
-        # cas_iaaa_login 返回 302 重定向，JWT 在 Location URL 的 token 参数中
         cas_login_url = (
             f"https://treehole.pku.edu.cn/cas_iaaa_login"
             f"?uuid={short_uuid}&plat=web&token={iaaa_token}"
@@ -200,10 +224,8 @@ class PKUAuth:
             logger.error(f"树洞 token 交换失败: {e}")
             raise
 
-        # 从 302 重定向的 Location header 中提取 JWT token
         if resp.status_code in (301, 302):
             location = resp.headers.get("Location", "")
-            # Location 格式: https://treehole.pku.edu.cn/web/iaaa_success?token=eyJ...
             parsed = urlparse(location)
             qs = parse_qs(parsed.query)
             token_list = qs.get("token", [])
@@ -213,7 +235,6 @@ class PKUAuth:
                 logger.error(f"重定向 URL 中未找到 token 参数: {location[:200]}")
                 raise RuntimeError("重定向 URL 中未找到 token")
         else:
-            # 非重定向，尝试从 JSON 响应提取
             try:
                 result = resp.json()
                 self.token = (
@@ -253,23 +274,38 @@ class TreeholeClient:
     def __init__(self, token: str, cookies: dict | None = None, config: dict | None = None):
         self.token = token
         self.config = config
-        self.session = requests.Session()
+        # 生成 Uuid（模拟 Web 前端行为，必须设置此 header 才能通过 API 验证）
+        self._uuid = f"Web_PKUHOLE_2.0.0_WEB_UUID_{uuid.uuid4()}"
+        self.session = _create_robust_session()
         if cookies:
             self.session.cookies.update(cookies)
         self.session.headers.update({
             "Authorization": f"Bearer {self.token}",
-            "User-Agent": (
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            ),
+            "Uuid": self._uuid,
+            "Referer": "https://treehole.pku.edu.cn/",
         })
-        self._verified = False
-        self._otp_verified = False
-        self._structure_logged = False
+        self._verified = False      # SMS 验证是否已完成
+        self._otp_verified = False  # App 令牌验证是否已完成
+
+    def _input_code(self, prompt: str) -> str:
+        """读取用户输入的验证码，支持环境变量 SmsCode 以兼容非交互模式"""
+        import os
+        env_code = os.environ.get("TREEHOLE_SMS_CODE", "").strip()
+        if env_code:
+            logger.info("从环境变量 TREEHOLE_SMS_CODE 读取验证码")
+            return env_code
+        try:
+            return console.input(prompt).strip()
+        except (EOFError, KeyboardInterrupt):
+            logger.error(
+                "无法读取验证码（非交互模式）。"
+                "请设置环境变量 TREEHOLE_SMS_CODE=验证码 后重新运行，"
+                "或在交互式终端中运行本程序。"
+            )
+            raise RuntimeError("非交互模式无法输入验证码，请设置 TREEHOLE_SMS_CODE 环境变量")
 
     def _handle_sms_verification(self):
-        """处理手机短信验证（首次使用时需要）— 必须手动输入"""
+        """处理手机短信验证（首次使用时需要）"""
         logger.warning("树洞要求手机短信验证（仅需验证一次）")
 
         if self.config:
@@ -285,14 +321,12 @@ class TreeholeClient:
 
         console.print(
             Panel(
-                "[bold yellow]请查看手机短信，输入收到的验证码[/bold yellow]",
+                "[bold yellow]请查看手机短信，输入收到的验证码[/bold yellow]\n"
+                "[dim]（也可设置环境变量 TREEHOLE_SMS_CODE=验证码 后重新运行）[/dim]",
                 title="[bold red]📱 短信验证[/bold red]",
             )
         )
-        code = console.input("  [bold yellow]验证码: [/bold yellow]").strip()
-
-        if not code:
-            raise RuntimeError("未输入验证码")
+        code = self._input_code("  [bold yellow]验证码: [/bold yellow]")
 
         # 提交验证码
         try:
@@ -330,7 +364,6 @@ class TreeholeClient:
             logger.info(f"TOTP 令牌已计算: {code}")
             return code
         else:
-            # 无 TOTP 密钥，通知用户手动输入
             if self.config:
                 notify_system_event(self.config, "App手机令牌", "检测到树洞需要App手机动态令牌验证，程序已暂停，请前往控制台查看并输入。")
 
@@ -341,7 +374,7 @@ class TreeholeClient:
                     title="[bold red]📱 手机令牌验证[/bold red]",
                 )
             )
-            code = console.input("  [bold yellow]手机令牌: [/bold yellow]").strip()
+            code = self._input_code("  [bold yellow]手机令牌: [/bold yellow]")
             match = re.search(r"\d{6}", code)
             if not match:
                 raise RuntimeError("无效的手机令牌")
@@ -401,9 +434,9 @@ class TreeholeClient:
                 logger.error("短信验证已完成但仍被拒绝，可能需要重新登录")
                 return []
 
-        # 检查是否需要 App 手机令牌验证 (code 40008)
-        if isinstance(data, dict) and data.get("code") == 40008:
-            if not getattr(self, "_otp_verified", False):
+        # 检查是否需要 App 手机令牌验证 (code 40008 或 40088)
+        if isinstance(data, dict) and data.get("code") in (40008, 40088):
+            if not self._otp_verified:
                 self._handle_otp_verification()
                 return self.get_latest_posts(page=page, limit=limit)
             else:
@@ -613,6 +646,7 @@ class TreeholeMonitor:
         self.auth = PKUAuth(
             config["pku"]["username"],
             config["pku"]["password"],
+            totp_secret=config.get("totp_secret"),
         )
         self.client: TreeholeClient | None = None
         self.keywords = config["keywords"]["list"]
@@ -625,9 +659,9 @@ class TreeholeMonitor:
             self.client = TreeholeClient(token, cookies, config=self.config)
             return
 
-        # 测试 token 是否有效
+        # 测试 token 是否有效（get_latest_posts 返回 [] 而非 None）
         posts = self.client.get_latest_posts(page=1, limit=1)
-        if posts is None:
+        if not posts:
             logger.warning("Token 可能已失效，正在重新登录...")
             token, cookies = self.auth.login()
             self.client = TreeholeClient(token, cookies, config=self.config)
@@ -717,6 +751,17 @@ class TreeholeMonitor:
                     logger.info("本轮未发现匹配帖子")
             except KeyboardInterrupt:
                 raise
+            except RuntimeError as e:
+                msg = str(e)
+                logger.error(f"致命错误: {e}")
+                if "非交互模式" in msg:
+                    console.print(
+                        Panel(
+                            f"[yellow]{msg}[/yellow]",
+                            title="[bold red]⚠️ 需要用户输入[/bold red]",
+                        )
+                    )
+                    sys.exit(1)
             except Exception as e:
                 logger.error(f"检查过程出错: {e}")
 
